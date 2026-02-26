@@ -4,7 +4,7 @@ import re
 
 import httpx
 
-from .config import OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT
+from .config import OLLAMA_API_KEY, OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_TIMEOUT
 
 log = logging.getLogger("soc")
 
@@ -55,8 +55,12 @@ async def ask_ollama(alert: dict, target_os: str) -> dict:
         "options": {"temperature": 0.1, "num_predict": 2048},
     }
 
+    headers = {}
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+
     async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
-        resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload)
+        resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, headers=headers)
         resp.raise_for_status()
 
     raw = resp.json().get("message", {}).get("content", "")
