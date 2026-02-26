@@ -1,0 +1,51 @@
+[
+  {
+    "timestamp": "2026-02-26T10:15:32Z",
+    "rule": { "id": "5710", "level": 10, "description": "Multiple authentication failures" },
+    "agent": { "name": "web-server-01" },
+    "data": { "srcip": "203.0.113.50" },
+    "full_log": "sshd[12345]: Failed password for root from 203.0.113.50 port 42218 ssh2"
+  },
+  {
+    "timestamp": "2026-02-26T10:18:44Z",
+    "rule": { "id": "31101", "level": 8, "description": "Nmap scan detected" },
+    "agent": { "name": "firewall-01" },
+    "data": { "srcip": "192.168.56.200" },
+    "full_log": "Nmap SYN scan from 192.168.56.200 on ports 1-1024"
+  },
+  {
+    "timestamp": "2026-02-26T10:22:10Z",
+    "rule": { "id": "5401", "level": 11, "description": "Insecure sudo command executed" },
+    "agent": { "name": "app-server-02" },
+    "data": { "dstuser": "deploy", "srcuser": "www-data" },
+    "full_log": "www-data : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/bin/bash"
+  },
+  {
+    "timestamp": "2026-02-26T10:30:00Z",
+    "rule": { "id": "100200", "level": 13, "description": "Crypto miner process detected" },
+    "agent": { "name": "compute-node-05" },
+    "data": { "pid": "31337", "process_name": "xmrig" },
+    "full_log": "xmrig --donate-level 1 -o stratum+tcp://pool.evil.com:3333"
+  },
+  {
+    "timestamp": "2026-02-26T10:35:20Z",
+    "rule": { "id": "550", "level": 9, "description": "Crontab modified by unknown user" },
+    "agent": { "name": "app-server-02" },
+    "data": { "user": "nobody" },
+    "full_log": "crontab: (nobody) REPLACE (nobody)"
+  },
+  {
+    "timestamp": "2026-02-26T10:40:00Z",
+    "rule": { "id": "1002", "level": 2, "description": "Agent heartbeat" },
+    "agent": { "name": "db-server-01" },
+    "data": {},
+    "full_log": "ossec: Agent heartbeat received"
+  },
+  {
+    "timestamp": "2026-02-26T10:45:55Z",
+    "rule": { "id": "87900", "level": 12, "description": "Something completely unknown happened" },
+    "agent": { "name": "mystery-box" },
+    "data": {},
+    "full_log": "Unrecognised event with no known pattern"
+  }
+]
