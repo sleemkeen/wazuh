@@ -1,4 +1,5 @@
 import logging
+import time
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
@@ -18,6 +19,27 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 AGENTS: dict = {}
 AUDIT: list[dict] = []
 
+# dedup: key = "agent|rule_id|srcip" → timestamp of last action
+DEDUP_CACHE: dict[str, float] = {}
+DEDUP_WINDOW = 300  # seconds — ignore duplicate incidents within 5 minutes
+
+
+def _dedup_key(agent_name: str, rule_id: str, data: dict) -> str:
+    srcip = data.get("srcip", data.get("src_ip", ""))
+    user = data.get("dstuser", data.get("user", ""))
+    return f"{agent_name}|{rule_id}|{srcip}|{user}"
+
+
+def _is_duplicate(key: str) -> bool:
+    last_seen = DEDUP_CACHE.get(key)
+    if last_seen and (time.time() - last_seen) < DEDUP_WINDOW:
+        return True
+    return False
+
+
+def _mark_seen(key: str):
+    DEDUP_CACHE[key] = time.time()
+
 
 @app.on_event("startup")
 async def startup():
@@ -25,6 +47,7 @@ async def startup():
     AGENTS = load_agents()
     log.info("Loaded %d agent(s): %s", len(AGENTS), list(AGENTS.keys()))
     log.info("Ollama endpoint: %s  model: %s", OLLAMA_BASE_URL, OLLAMA_MODEL)
+    log.info("Dedup window: %ds", DEDUP_WINDOW)
 
 
 class AlertRule(BaseModel):
@@ -50,6 +73,8 @@ async def health():
         "ollama": OLLAMA_BASE_URL,
         "model": OLLAMA_MODEL,
         "agents": list(AGENTS.keys()),
+        "dedup_window_seconds": DEDUP_WINDOW,
+        "dedup_active_keys": len(DEDUP_CACHE),
     }
 
 
@@ -68,6 +93,20 @@ async def webhook(alert: WazuhAlert):
         log.warning("  Agent '%s' NOT FOUND in inventory. Available: %s", agent_name, list(AGENTS.keys()))
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
+
+    # ── Dedup check ────────────────────────────────────────────────
+    key = _dedup_key(agent_name, alert.rule.id, alert.data)
+    if _is_duplicate(key):
+        log.info("[DEDUP] Duplicate incident — already handled within %ds. Skipping.", DEDUP_WINDOW)
+        log.info("  Key: %s", key)
+        log.info("=" * 60)
+        return {
+            "decision": {"action": "IGNORE", "reason": "Duplicate incident, already remediated."},
+            "agent": agent_name,
+            "agent_os": target_os,
+            "execution": {"executed": False, "output": "", "error": ""},
+            "deduplicated": True,
+        }
 
     log.info("[STEP 2] SENDING TO OLLAMA (%s)...", OLLAMA_MODEL)
     try:
@@ -114,6 +153,9 @@ async def webhook(alert: WazuhAlert):
         else:
             log.error("[STEP 5] EXECUTION FAILED")
             log.error("  Error: %s", execution["error"][:300])
+
+        _mark_seen(key)
+        log.info("[DEDUP] Marked key for %ds cooldown: %s", DEDUP_WINDOW, key)
     elif action != "IGNORE" and not agent:
         log.warning("[STEP 4] SKIPPED — agent '%s' not in inventory", agent_name)
         execution["error"] = f"Agent '{agent_name}' not in inventory."
@@ -137,6 +179,7 @@ async def webhook(alert: WazuhAlert):
         "agent": agent_name,
         "agent_os": target_os,
         "execution": execution,
+        "deduplicated": False,
     }
 
 
