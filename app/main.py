@@ -61,7 +61,11 @@ async def webhook(alert: WazuhAlert):
 
     log.info("=" * 60)
     log.info("[STEP 1] ALERT RECEIVED")
-    log.info("  Agent: %s  OS: %s", agent_name, target_os)
+    log.info("  Agent: '%s'  OS: %s", agent_name, target_os)
+    if agent:
+        log.info("  Agent FOUND in inventory → %s@%s", agent["username"], agent["host"])
+    else:
+        log.warning("  Agent '%s' NOT FOUND in inventory. Available: %s", agent_name, list(AGENTS.keys()))
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
 

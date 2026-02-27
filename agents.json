@@ -1,12 +1,12 @@
 {
-  "web-server-01": {
+  "ubuntu": {
     "host": "192.168.56.113",
     "port": 22,
     "username": "vboxuser",
     "password": "28487985",
     "os": "ubuntu"
   },
-  "win-server-01": {
+  "DESKTOP-KAGJ25A": {
     "host": "192.168.56.112",
     "port": 22,
     "username": "labuser",
