@@ -24,6 +24,7 @@ async def startup():
     global AGENTS
     AGENTS = load_agents()
     log.info("Loaded %d agent(s): %s", len(AGENTS), list(AGENTS.keys()))
+    log.info("Ollama endpoint: %s  model: %s", OLLAMA_BASE_URL, OLLAMA_MODEL)
 
 
 class AlertRule(BaseModel):
@@ -58,10 +59,17 @@ async def webhook(alert: WazuhAlert):
     agent = AGENTS.get(agent_name)
     target_os = agent.get("os", "ubuntu") if agent else "ubuntu"
 
+    log.info("=" * 60)
+    log.info("[STEP 1] ALERT RECEIVED")
+    log.info("  Agent: %s  OS: %s", agent_name, target_os)
+    log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
+    log.info("  Log: %s", alert.full_log[:200])
+
+    log.info("[STEP 2] SENDING TO OLLAMA (%s)...", OLLAMA_MODEL)
     try:
         decision = await ask_ollama(alert.model_dump(), target_os)
     except Exception as e:
-        log.error("Ollama failed: %s", e)
+        log.error("[STEP 2] OLLAMA FAILED: %s", e)
         decision = {
             "action": "IGNORE",
             "severity": "low",
@@ -73,9 +81,18 @@ async def webhook(alert: WazuhAlert):
     action = decision.get("action", "IGNORE")
     script = decision.get("script", "")
 
+    log.info("[STEP 3] AI DECISION")
+    log.info("  Action:   %s", action)
+    log.info("  Severity: %s", decision.get("severity", "?"))
+    log.info("  Summary:  %s", decision.get("summary", "?"))
+    log.info("  Reason:   %s", decision.get("reason", "?"))
+    if script:
+        log.info("  Script:   %s", script[:200])
+
     execution = {"executed": False, "output": "", "error": ""}
 
     if action != "IGNORE" and script and agent:
+        log.info("[STEP 4] EXECUTING REMEDIATION via SSH on %s (%s)...", agent_name, agent["host"])
         execution = await run_ssh(
             host=agent["host"],
             port=agent.get("port", 22),
@@ -86,8 +103,18 @@ async def webhook(alert: WazuhAlert):
             target_os=target_os,
         )
         execution["executed"] = True
+
+        if execution["success"]:
+            log.info("[STEP 5] EXECUTION SUCCESS")
+            log.info("  Output: %s", execution["output"][:300])
+        else:
+            log.error("[STEP 5] EXECUTION FAILED")
+            log.error("  Error: %s", execution["error"][:300])
     elif action != "IGNORE" and not agent:
+        log.warning("[STEP 4] SKIPPED — agent '%s' not in inventory", agent_name)
         execution["error"] = f"Agent '{agent_name}' not in inventory."
+    else:
+        log.info("[STEP 4] SKIPPED — action is IGNORE, nothing to execute")
 
     AUDIT.append({
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -97,7 +124,9 @@ async def webhook(alert: WazuhAlert):
         "action": action,
         "executed": execution.get("executed", False),
     })
-    log.info("action=%s  executed=%s  agent=%s", action, execution.get("executed"), agent_name)
+
+    log.info("[DONE] action=%s  executed=%s  agent=%s", action, execution.get("executed"), agent_name)
+    log.info("=" * 60)
 
     return {
         "decision": decision,
@@ -109,12 +138,23 @@ async def webhook(alert: WazuhAlert):
 
 @app.post("/analyze")
 async def analyze_only(alert: WazuhAlert):
+    log.info("=" * 60)
+    log.info("[DRY RUN] Analyzing alert — no SSH execution")
+    log.info("  Agent: %s  Rule: %s (level %d)", alert.agent.name, alert.rule.description, alert.rule.level)
+
     agent = AGENTS.get(alert.agent.name)
     target_os = agent.get("os", "ubuntu") if agent else "ubuntu"
+
+    log.info("[DRY RUN] Sending to Ollama (%s)...", OLLAMA_MODEL)
     try:
-        return await ask_ollama(alert.model_dump(), target_os)
+        result = await ask_ollama(alert.model_dump(), target_os)
     except Exception as e:
+        log.error("[DRY RUN] Ollama failed: %s", e)
         return {"action": "IGNORE", "summary": f"LLM error: {e}", "script": ""}
+
+    log.info("[DRY RUN] AI says: %s — %s", result.get("action"), result.get("summary"))
+    log.info("=" * 60)
+    return result
 
 
 @app.get("/audit")

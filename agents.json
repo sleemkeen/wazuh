@@ -1,23 +1,16 @@
 {
   "web-server-01": {
-    "host": "192.168.1.10",
+    "host": "192.168.56.113",
     "port": 22,
-    "username": "admin",
-    "password": "changeme",
-    "os": "ubuntu"
-  },
-  "app-server-02": {
-    "host": "192.168.1.11",
-    "port": 22,
-    "username": "deploy",
-    "key_file": "/keys/app-server-02.pem",
+    "username": "vboxuser",
+    "password": "28487985",
     "os": "ubuntu"
   },
   "win-server-01": {
-    "host": "192.168.1.20",
+    "host": "192.168.56.112",
     "port": 22,
-    "username": "Administrator",
-    "password": "changeme",
+    "username": "labuser",
+    "password": "1234",
     "os": "windows"
   }
 }

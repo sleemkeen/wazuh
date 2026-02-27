@@ -59,11 +59,15 @@ async def ask_ollama(alert: dict, target_os: str) -> dict:
     if OLLAMA_API_KEY:
         headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
 
+    log.info("  Ollama POST %s/api/chat  model=%s", OLLAMA_BASE_URL, OLLAMA_MODEL)
+
     async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT) as client:
         resp = await client.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, headers=headers)
         resp.raise_for_status()
 
     raw = resp.json().get("message", {}).get("content", "")
+    log.info("  Ollama responded (%d chars)", len(raw))
+
     text = raw.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
