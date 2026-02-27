@@ -94,7 +94,18 @@ async def webhook(alert: WazuhAlert):
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
 
-    # ── Dedup check ────────────────────────────────────────────────
+    MIN_LEVEL = 8
+    if alert.rule.level < MIN_LEVEL:
+        log.info("[FILTERED] Level %d < %d — %s. IGNORE.", alert.rule.level, MIN_LEVEL, alert.rule.description)
+        log.info("=" * 60)
+        return {
+            "decision": {"action": "IGNORE", "reason": f"Level {alert.rule.level} below threshold ({MIN_LEVEL})."},
+            "agent": agent_name,
+            "agent_os": target_os,
+            "execution": {"executed": False, "output": "", "error": ""},
+            "filtered": True,
+        }
+
     key = _dedup_key(agent_name, alert.rule.id, alert.data)
     if _is_duplicate(key):
         log.info("[DEDUP] Duplicate incident — already handled within %ds. Skipping.", DEDUP_WINDOW)
