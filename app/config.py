@@ -11,6 +11,10 @@ OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "120"))
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+DEDUP_WINDOW = int(os.getenv("DEDUP_WINDOW", "300"))
+MIN_LEVEL = int(os.getenv("MIN_LEVEL", "8"))
+
 _AGENTS_FILE = os.getenv("AGENTS_FILE", "agents.json")
 
 

@@ -1,12 +1,21 @@
+import asyncio
+import json
 import logging
-import time
 from datetime import datetime, timezone
 
+import redis.asyncio as redis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .config import OLLAMA_BASE_URL, OLLAMA_MODEL, load_agents
+from .config import (
+    DEDUP_WINDOW,
+    MIN_LEVEL,
+    OLLAMA_BASE_URL,
+    OLLAMA_MODEL,
+    REDIS_URL,
+    load_agents,
+)
 from .executor import run_ssh
 from .llm import ask_ollama
 
@@ -19,35 +28,38 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 AGENTS: dict = {}
 AUDIT: list[dict] = []
 
-# dedup: key = "agent|rule_id|srcip" → timestamp of last action
-DEDUP_CACHE: dict[str, float] = {}
-DEDUP_WINDOW = 300  # seconds — ignore duplicate incidents within 5 minutes
+rdb: redis.Redis | None = None
+
+QUEUE_KEY = "soc:queue"
+DEDUP_PREFIX = "soc:dedup:"
+PROCESSING_LOCK = asyncio.Lock()
 
 
 def _dedup_key(agent_name: str, rule_id: str, data: dict) -> str:
     srcip = data.get("srcip", data.get("src_ip", ""))
     user = data.get("dstuser", data.get("user", ""))
-    return f"{agent_name}|{rule_id}|{srcip}|{user}"
-
-
-def _is_duplicate(key: str) -> bool:
-    last_seen = DEDUP_CACHE.get(key)
-    if last_seen and (time.time() - last_seen) < DEDUP_WINDOW:
-        return True
-    return False
-
-
-def _mark_seen(key: str):
-    DEDUP_CACHE[key] = time.time()
+    return f"{DEDUP_PREFIX}{agent_name}|{rule_id}|{srcip}|{user}"
 
 
 @app.on_event("startup")
 async def startup():
-    global AGENTS
+    global AGENTS, rdb
     AGENTS = load_agents()
+    rdb = redis.from_url(REDIS_URL, decode_responses=True)
+    await rdb.ping()
+    log.info("Redis connected: %s", REDIS_URL)
     log.info("Loaded %d agent(s): %s", len(AGENTS), list(AGENTS.keys()))
-    log.info("Ollama endpoint: %s  model: %s", OLLAMA_BASE_URL, OLLAMA_MODEL)
-    log.info("Dedup window: %ds", DEDUP_WINDOW)
+    log.info("Ollama: %s  model: %s", OLLAMA_BASE_URL, OLLAMA_MODEL)
+    log.info("Min level: %d  Dedup window: %ds", MIN_LEVEL, DEDUP_WINDOW)
+
+    asyncio.create_task(_worker())
+    log.info("Queue worker started — processing 1 alert at a time")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if rdb:
+        await rdb.aclose()
 
 
 class AlertRule(BaseModel):
@@ -68,56 +80,73 @@ class WazuhAlert(BaseModel):
 
 @app.get("/health")
 async def health():
+    queue_len = await rdb.llen(QUEUE_KEY) if rdb else 0
     return {
         "status": "ok",
         "ollama": OLLAMA_BASE_URL,
         "model": OLLAMA_MODEL,
         "agents": list(AGENTS.keys()),
+        "redis": REDIS_URL,
+        "queue_length": queue_len,
+        "min_level": MIN_LEVEL,
         "dedup_window_seconds": DEDUP_WINDOW,
-        "dedup_active_keys": len(DEDUP_CACHE),
     }
 
 
 @app.post("/webhook")
 async def webhook(alert: WazuhAlert):
     agent_name = alert.agent.name
+
+    if alert.rule.level < MIN_LEVEL:
+        log.info("[FILTERED] Level %d < %d — %s. IGNORE.", alert.rule.level, MIN_LEVEL, alert.rule.description)
+        return {
+            "status": "filtered",
+            "reason": f"Level {alert.rule.level} below threshold ({MIN_LEVEL}).",
+        }
+
+    key = _dedup_key(agent_name, alert.rule.id, alert.data)
+    if rdb and await rdb.exists(key):
+        ttl = await rdb.ttl(key)
+        log.info("[DEDUP] Already handled. Cooldown %ds remaining. Key: %s", ttl, key)
+        return {
+            "status": "deduplicated",
+            "reason": f"Already remediated. Cooldown {ttl}s remaining.",
+        }
+
+    payload = alert.model_dump_json()
+    await rdb.rpush(QUEUE_KEY, payload)
+    queue_len = await rdb.llen(QUEUE_KEY)
+    log.info("[QUEUED] Rule [%s] %s → position %d in queue", alert.rule.id, alert.rule.description, queue_len)
+
+    return {
+        "status": "queued",
+        "queue_position": queue_len,
+        "agent": agent_name,
+        "rule": alert.rule.description,
+    }
+
+
+async def _process_alert(raw: str):
+    alert = WazuhAlert.model_validate_json(raw)
+    agent_name = alert.agent.name
     agent = AGENTS.get(agent_name)
     target_os = agent.get("os", "ubuntu") if agent else "ubuntu"
 
     log.info("=" * 60)
-    log.info("[STEP 1] ALERT RECEIVED")
+    log.info("[STEP 1] PROCESSING ALERT FROM QUEUE")
     log.info("  Agent: '%s'  OS: %s", agent_name, target_os)
     if agent:
-        log.info("  Agent FOUND in inventory → %s@%s", agent["username"], agent["host"])
+        log.info("  Agent FOUND → %s@%s", agent["username"], agent["host"])
     else:
-        log.warning("  Agent '%s' NOT FOUND in inventory. Available: %s", agent_name, list(AGENTS.keys()))
+        log.warning("  Agent '%s' NOT FOUND. Available: %s", agent_name, list(AGENTS.keys()))
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
 
-    MIN_LEVEL = 8
-    if alert.rule.level < MIN_LEVEL:
-        log.info("[FILTERED] Level %d < %d — %s. IGNORE.", alert.rule.level, MIN_LEVEL, alert.rule.description)
-        log.info("=" * 60)
-        return {
-            "decision": {"action": "IGNORE", "reason": f"Level {alert.rule.level} below threshold ({MIN_LEVEL})."},
-            "agent": agent_name,
-            "agent_os": target_os,
-            "execution": {"executed": False, "output": "", "error": ""},
-            "filtered": True,
-        }
-
     key = _dedup_key(agent_name, alert.rule.id, alert.data)
-    if _is_duplicate(key):
-        log.info("[DEDUP] Duplicate incident — already handled within %ds. Skipping.", DEDUP_WINDOW)
-        log.info("  Key: %s", key)
+    if rdb and await rdb.exists(key):
+        log.info("[DEDUP] Already handled while queued. Skipping.")
         log.info("=" * 60)
-        return {
-            "decision": {"action": "IGNORE", "reason": "Duplicate incident, already remediated."},
-            "agent": agent_name,
-            "agent_os": target_os,
-            "execution": {"executed": False, "output": "", "error": ""},
-            "deduplicated": True,
-        }
+        return
 
     log.info("[STEP 2] SENDING TO OLLAMA (%s)...", OLLAMA_MODEL)
     try:
@@ -143,11 +172,13 @@ async def webhook(alert: WazuhAlert):
     if script:
         log.info("  Script:   %s", script[:200])
 
-    execution = {"executed": False, "output": "", "error": ""}
+    executed = False
+    output = ""
+    error = ""
 
     if action != "IGNORE" and script and agent:
-        log.info("[STEP 4] EXECUTING REMEDIATION via SSH on %s (%s)...", agent_name, agent["host"])
-        execution = await run_ssh(
+        log.info("[STEP 4] EXECUTING via SSH on %s (%s)...", agent_name, agent["host"])
+        result = await run_ssh(
             host=agent["host"],
             port=agent.get("port", 22),
             username=agent["username"],
@@ -156,22 +187,24 @@ async def webhook(alert: WazuhAlert):
             key_file=agent.get("key_file"),
             target_os=target_os,
         )
-        execution["executed"] = True
+        executed = True
+        output = result.get("output", "")
+        error = result.get("error", "")
 
-        if execution["success"]:
+        if result["success"]:
             log.info("[STEP 5] EXECUTION SUCCESS")
-            log.info("  Output: %s", execution["output"][:300])
+            log.info("  Output: %s", output[:300])
         else:
             log.error("[STEP 5] EXECUTION FAILED")
-            log.error("  Error: %s", execution["error"][:300])
+            log.error("  Error: %s", error[:300])
 
-        _mark_seen(key)
-        log.info("[DEDUP] Marked key for %ds cooldown: %s", DEDUP_WINDOW, key)
+        if rdb:
+            await rdb.setex(key, DEDUP_WINDOW, "1")
+            log.info("[DEDUP] Cooldown set: %ds for %s", DEDUP_WINDOW, key)
     elif action != "IGNORE" and not agent:
         log.warning("[STEP 4] SKIPPED — agent '%s' not in inventory", agent_name)
-        execution["error"] = f"Agent '{agent_name}' not in inventory."
     else:
-        log.info("[STEP 4] SKIPPED — action is IGNORE, nothing to execute")
+        log.info("[STEP 4] SKIPPED — action is IGNORE")
 
     AUDIT.append({
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -179,42 +212,47 @@ async def webhook(alert: WazuhAlert):
         "rule": alert.rule.description,
         "level": alert.rule.level,
         "action": action,
-        "executed": execution.get("executed", False),
+        "executed": executed,
+        "output": output[:200],
+        "error": error[:200],
     })
 
-    log.info("[DONE] action=%s  executed=%s  agent=%s", action, execution.get("executed"), agent_name)
+    log.info("[DONE] action=%s  executed=%s  agent=%s", action, executed, agent_name)
     log.info("=" * 60)
 
-    return {
-        "decision": decision,
-        "agent": agent_name,
-        "agent_os": target_os,
-        "execution": execution,
-        "deduplicated": False,
-    }
+
+async def _worker():
+    log.info("[WORKER] Waiting for alerts...")
+    while True:
+        try:
+            item = await rdb.blpop(QUEUE_KEY, timeout=1)
+            if item:
+                _, raw = item
+                queue_len = await rdb.llen(QUEUE_KEY)
+                log.info("[WORKER] Processing alert (%d remaining in queue)", queue_len)
+                await _process_alert(raw)
+        except Exception as e:
+            log.error("[WORKER] Error: %s", e)
+            await asyncio.sleep(2)
 
 
 @app.post("/analyze")
 async def analyze_only(alert: WazuhAlert):
-    log.info("=" * 60)
-    log.info("[DRY RUN] Analyzing alert — no SSH execution")
-    log.info("  Agent: %s  Rule: %s (level %d)", alert.agent.name, alert.rule.description, alert.rule.level)
-
+    log.info("[DRY RUN] Rule: %s (level %d)", alert.rule.description, alert.rule.level)
     agent = AGENTS.get(alert.agent.name)
     target_os = agent.get("os", "ubuntu") if agent else "ubuntu"
-
-    log.info("[DRY RUN] Sending to Ollama (%s)...", OLLAMA_MODEL)
     try:
-        result = await ask_ollama(alert.model_dump(), target_os)
+        return await ask_ollama(alert.model_dump(), target_os)
     except Exception as e:
-        log.error("[DRY RUN] Ollama failed: %s", e)
         return {"action": "IGNORE", "summary": f"LLM error: {e}", "script": ""}
-
-    log.info("[DRY RUN] AI says: %s — %s", result.get("action"), result.get("summary"))
-    log.info("=" * 60)
-    return result
 
 
 @app.get("/audit")
 async def audit():
     return list(reversed(AUDIT))
+
+
+@app.get("/queue")
+async def queue_status():
+    queue_len = await rdb.llen(QUEUE_KEY) if rdb else 0
+    return {"queue_length": queue_len}
