@@ -32,7 +32,7 @@ RULES:
 - Benign or unclear                 → IGNORE
 
 SCRIPT RULES:
-- For ubuntu: write a bash script
+- For ubuntu: write a bash script. Always use sudo for commands that need root (iptables, usermod, kill, etc.)
 - For windows: write a powershell script
 - The script must be safe, focused, and only address the specific threat
 - Include a verification step at the end (e.g. check the rule was added, user was locked, process is dead)
