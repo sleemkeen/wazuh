@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+import uuid
 from datetime import datetime, timezone
 
 import redis.asyncio as redis
@@ -22,6 +24,7 @@ AUDIT: list[dict] = []
 
 rdb: redis.Redis | None = None
 QUEUE_KEY = "soc:queue"
+JOB_PREFIX = "soc:job:"
 
 
 @app.on_event("startup")
@@ -86,27 +89,53 @@ async def webhook(alert: WazuhAlert):
             "reason": f"Level {alert.rule.level} below threshold ({MIN_LEVEL}).",
         }
 
-    payload = alert.model_dump_json()
-    await rdb.rpush(QUEUE_KEY, payload)
+    job_id = str(uuid.uuid4())[:8]
+    job_data = {
+        "job_id": job_id,
+        "alert": alert.model_dump(),
+        "status": "queued",
+        "queued_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    import json
+    await rdb.rpush(QUEUE_KEY, json.dumps(job_data))
+    await rdb.setex(f"{JOB_PREFIX}{job_id}", 300, json.dumps({"status": "queued", "queued_at": job_data["queued_at"]}))
     queue_len = await rdb.llen(QUEUE_KEY)
-    log.info("[QUEUED] Rule [%s] %s → position %d in queue", alert.rule.id, alert.rule.description, queue_len)
+
+    log.info("[QUEUED] job=%s  Rule [%s] %s → position %d", job_id, alert.rule.id, alert.rule.description, queue_len)
 
     return {
         "status": "queued",
+        "job_id": job_id,
         "queue_position": queue_len,
         "agent": agent_name,
         "rule": alert.rule.description,
     }
 
 
+@app.get("/job/{job_id}")
+async def get_job(job_id: str):
+    import json
+    raw = await rdb.get(f"{JOB_PREFIX}{job_id}")
+    if not raw:
+        return {"error": f"Job {job_id} not found or expired."}
+    return json.loads(raw)
+
+
 async def _process_alert(raw: str):
-    alert = WazuhAlert.model_validate_json(raw)
+    import json
+    job_data = json.loads(raw)
+    job_id = job_data["job_id"]
+    alert = WazuhAlert.model_validate(job_data["alert"])
     agent_name = alert.agent.name
     agent = AGENTS.get(agent_name)
     target_os = agent.get("os", "ubuntu") if agent else "ubuntu"
+    start = time.time()
+
+    await rdb.setex(f"{JOB_PREFIX}{job_id}", 300, json.dumps({"status": "processing", "started_at": datetime.now(timezone.utc).isoformat()}))
 
     log.info("=" * 60)
-    log.info("[STEP 1] PROCESSING ALERT FROM QUEUE")
+    log.info("[STEP 1] job=%s  PROCESSING ALERT", job_id)
     log.info("  Agent: '%s'  OS: %s", agent_name, target_os)
     if agent:
         log.info("  Agent FOUND → %s@%s", agent["username"], agent["host"])
@@ -115,11 +144,11 @@ async def _process_alert(raw: str):
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
 
-    log.info("[STEP 2] SENDING TO OLLAMA (%s)...", OLLAMA_MODEL)
+    log.info("[STEP 2] job=%s  SENDING TO OLLAMA (%s)...", job_id, OLLAMA_MODEL)
     try:
         decision = await ask_ollama(alert.model_dump(), target_os)
     except Exception as e:
-        log.error("[STEP 2] OLLAMA FAILED: %s", e)
+        log.error("[STEP 2] job=%s  OLLAMA FAILED: %s", job_id, e)
         decision = {
             "action": "IGNORE",
             "severity": "low",
@@ -131,7 +160,7 @@ async def _process_alert(raw: str):
     action = decision.get("action", "IGNORE")
     script = decision.get("script", "")
 
-    log.info("[STEP 3] AI DECISION")
+    log.info("[STEP 3] job=%s  AI DECISION", job_id)
     log.info("  Action:   %s", action)
     log.info("  Severity: %s", decision.get("severity", "?"))
     log.info("  Summary:  %s", decision.get("summary", "?"))
@@ -144,7 +173,7 @@ async def _process_alert(raw: str):
     error = ""
 
     if action != "IGNORE" and script and agent:
-        log.info("[STEP 4] EXECUTING via SSH on %s (%s)...", agent_name, agent["host"])
+        log.info("[STEP 4] job=%s  EXECUTING via SSH on %s (%s)...", job_id, agent_name, agent["host"])
         result = await run_ssh(
             host=agent["host"],
             port=agent.get("port", 22),
@@ -159,28 +188,38 @@ async def _process_alert(raw: str):
         error = result.get("error", "")
 
         if result["success"]:
-            log.info("[STEP 5] EXECUTION SUCCESS")
+            log.info("[STEP 5] job=%s  EXECUTION SUCCESS", job_id)
             log.info("  Output: %s", output[:300])
         else:
-            log.error("[STEP 5] EXECUTION FAILED")
+            log.error("[STEP 5] job=%s  EXECUTION FAILED", job_id)
             log.error("  Error: %s", error[:300])
     elif action != "IGNORE" and not agent:
-        log.warning("[STEP 4] SKIPPED — agent '%s' not in inventory", agent_name)
+        log.warning("[STEP 4] job=%s  SKIPPED — agent '%s' not in inventory", job_id, agent_name)
     else:
-        log.info("[STEP 4] SKIPPED — action is IGNORE")
+        log.info("[STEP 4] job=%s  SKIPPED — action is IGNORE", job_id)
 
-    AUDIT.append({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+    elapsed = round(time.time() - start, 2)
+
+    job_result = {
+        "status": "completed",
+        "job_id": job_id,
         "agent": agent_name,
         "rule": alert.rule.description,
         "level": alert.rule.level,
         "action": action,
         "executed": executed,
-        "output": output[:200],
-        "error": error[:200],
-    })
+        "output": output[:500],
+        "error": error[:500],
+        "elapsed_seconds": elapsed,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await rdb.setex(f"{JOB_PREFIX}{job_id}", 300, json.dumps(job_result))
 
-    log.info("[DONE] action=%s  executed=%s  agent=%s", action, executed, agent_name)
+    AUDIT.append(job_result)
+    if len(AUDIT) > 200:
+        AUDIT[:] = AUDIT[-200:]
+
+    log.info("[DONE] job=%s  action=%s  executed=%s  agent=%s  took=%.2fs", job_id, action, executed, agent_name, elapsed)
     log.info("=" * 60)
 
 
@@ -192,7 +231,7 @@ async def _worker():
             if item:
                 _, raw = item
                 queue_len = await rdb.llen(QUEUE_KEY)
-                log.info("[WORKER] Processing alert (%d remaining in queue)", queue_len)
+                log.info("[WORKER] Picked up job (%d remaining in queue)", queue_len)
                 await _process_alert(raw)
         except Exception as e:
             log.error("[WORKER] Error: %s", e)
