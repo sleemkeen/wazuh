@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 from datetime import datetime, timezone
 
@@ -8,14 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .config import (
-    DEDUP_WINDOW,
-    MIN_LEVEL,
-    OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
-    REDIS_URL,
-    load_agents,
-)
+from .config import MIN_LEVEL, OLLAMA_BASE_URL, OLLAMA_MODEL, REDIS_URL, load_agents
 from .executor import run_ssh
 from .llm import ask_ollama
 
@@ -29,16 +21,7 @@ AGENTS: dict = {}
 AUDIT: list[dict] = []
 
 rdb: redis.Redis | None = None
-
 QUEUE_KEY = "soc:queue"
-DEDUP_PREFIX = "soc:dedup:"
-PROCESSING_LOCK = asyncio.Lock()
-
-
-def _dedup_key(agent_name: str, rule_id: str, data: dict) -> str:
-    srcip = data.get("srcip", data.get("src_ip", ""))
-    user = data.get("dstuser", data.get("user", ""))
-    return f"{DEDUP_PREFIX}{agent_name}|{rule_id}|{srcip}|{user}"
 
 
 @app.on_event("startup")
@@ -50,7 +33,7 @@ async def startup():
     log.info("Redis connected: %s", REDIS_URL)
     log.info("Loaded %d agent(s): %s", len(AGENTS), list(AGENTS.keys()))
     log.info("Ollama: %s  model: %s", OLLAMA_BASE_URL, OLLAMA_MODEL)
-    log.info("Min level: %d  Dedup window: %ds", MIN_LEVEL, DEDUP_WINDOW)
+    log.info("Min level: %d", MIN_LEVEL)
 
     asyncio.create_task(_worker())
     log.info("Queue worker started — processing 1 alert at a time")
@@ -89,7 +72,6 @@ async def health():
         "redis": REDIS_URL,
         "queue_length": queue_len,
         "min_level": MIN_LEVEL,
-        "dedup_window_seconds": DEDUP_WINDOW,
     }
 
 
@@ -102,15 +84,6 @@ async def webhook(alert: WazuhAlert):
         return {
             "status": "filtered",
             "reason": f"Level {alert.rule.level} below threshold ({MIN_LEVEL}).",
-        }
-
-    key = _dedup_key(agent_name, alert.rule.id, alert.data)
-    if rdb and await rdb.exists(key):
-        ttl = await rdb.ttl(key)
-        log.info("[DEDUP] Already handled. Cooldown %ds remaining. Key: %s", ttl, key)
-        return {
-            "status": "deduplicated",
-            "reason": f"Already remediated. Cooldown {ttl}s remaining.",
         }
 
     payload = alert.model_dump_json()
@@ -141,12 +114,6 @@ async def _process_alert(raw: str):
         log.warning("  Agent '%s' NOT FOUND. Available: %s", agent_name, list(AGENTS.keys()))
     log.info("  Rule: [%s] %s (level %d)", alert.rule.id, alert.rule.description, alert.rule.level)
     log.info("  Log: %s", alert.full_log[:200])
-
-    key = _dedup_key(agent_name, alert.rule.id, alert.data)
-    if rdb and await rdb.exists(key):
-        log.info("[DEDUP] Already handled while queued. Skipping.")
-        log.info("=" * 60)
-        return
 
     log.info("[STEP 2] SENDING TO OLLAMA (%s)...", OLLAMA_MODEL)
     try:
@@ -197,10 +164,6 @@ async def _process_alert(raw: str):
         else:
             log.error("[STEP 5] EXECUTION FAILED")
             log.error("  Error: %s", error[:300])
-
-        if rdb:
-            await rdb.setex(key, DEDUP_WINDOW, "1")
-            log.info("[DEDUP] Cooldown set: %ds for %s", DEDUP_WINDOW, key)
     elif action != "IGNORE" and not agent:
         log.warning("[STEP 4] SKIPPED — agent '%s' not in inventory", agent_name)
     else:
